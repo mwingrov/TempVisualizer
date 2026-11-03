@@ -9,6 +9,8 @@
 #include <sstream>
 #include <vector>
 #include <ctime>
+#include <chrono>
+#include <filesystem>
 #include <windows.h>
 #include <commdlg.h>
 
@@ -46,16 +48,33 @@ TemperatureEntry ParseLine(const std::string& line) {
     TemperatureEntry entry{-1.0, 0.0};
     if (line.empty()) return entry;
 
-    // 1. Extract the full timestamp string block (first 19 characters)
-    // Example format: "2026-02-04 14:46:20"
+    // Older logs start with a timestamp such as "2026-02-04 14:46:20".
     if (line.length() >= 19) {
-        std::string fullDateStr = line.substr(0, 19); 
-        entry.timestamp = DateStringToEpoch(fullDateStr);
-    } else {
-        return entry; // Line too short
+        entry.timestamp = DateStringToEpoch(line.substr(0, 19));
     }
 
-    // 2. Locate the precise text token key wrapper: "\"TempR2\":"
+    // Newer logs store the timestamp in separate JSON Date and Time fields.
+    if (entry.timestamp < 0.0) {
+        auto getJsonString = [&line](const std::string& key, std::string& value) {
+            const std::string marker = "\"" + key + "\":\"";
+            const size_t valueStart = line.find(marker);
+            if (valueStart == std::string::npos) return false;
+
+            const size_t contentStart = valueStart + marker.length();
+            const size_t valueEnd = line.find('"', contentStart);
+            if (valueEnd == std::string::npos) return false;
+
+            value = line.substr(contentStart, valueEnd - contentStart);
+            return true;
+        };
+
+        std::string date;
+        std::string time;
+        if (getJsonString("Date", date) && getJsonString("Time", time)) {
+            entry.timestamp = DateStringToEpoch(date + " " + time);
+        }
+    }
+
     std::string key = "\"TempR2\":";
     size_t keyPos = line.find(key);
     
@@ -76,6 +95,72 @@ TemperatureEntry ParseLine(const std::string& line) {
     }
 
     return entry;
+}
+
+struct LogFileVersion {
+    std::uintmax_t size;
+    std::filesystem::file_time_type lastWriteTime;
+};
+
+bool operator==(const LogFileVersion& left, const LogFileVersion& right) {
+    return left.size == right.size && left.lastWriteTime == right.lastWriteTime;
+}
+
+bool GetLogFileVersion(const std::string& filePath, LogFileVersion& version, std::string& error) {
+    std::error_code errorCode;
+    version.size = std::filesystem::file_size(filePath, errorCode);
+    if (errorCode) {
+        error = "Unable to check log file: " + errorCode.message();
+        return false;
+    }
+
+    version.lastWriteTime = std::filesystem::last_write_time(filePath, errorCode);
+    if (errorCode) {
+        error = "Unable to check log file: " + errorCode.message();
+        return false;
+    }
+
+    return true;
+}
+
+bool ReloadLogFile(
+    const std::string& filePath,
+    std::vector<double>& timestamps,
+    std::vector<double>& temperatures,
+    LogFileVersion& loadedVersion,
+    std::string& error) {
+    LogFileVersion currentVersion;
+    if (!GetLogFileVersion(filePath, currentVersion, error)) {
+        return false;
+    }
+
+    std::ifstream input(filePath);
+    if (!input.is_open()) {
+        error = "Unable to open log file for reading.";
+        return false;
+    }
+
+    std::vector<double> newTimestamps;
+    std::vector<double> newTemperatures;
+    std::string line;
+    while (std::getline(input, line)) {
+        TemperatureEntry data = ParseLine(line);
+        if (data.timestamp >= 0.0) {
+            newTimestamps.push_back(data.timestamp);
+            newTemperatures.push_back(data.temperature);
+        }
+    }
+
+    if (input.bad()) {
+        error = "An error occurred while reading the log file.";
+        return false;
+    }
+
+    timestamps.swap(newTimestamps);
+    temperatures.swap(newTemperatures);
+    loadedVersion = currentVersion;
+    error.clear();
+    return true;
 }
 
 // Function to trigger the built-in Windows Open File Explorer window
@@ -111,14 +196,18 @@ std::string GetExecutableDirectory() {
 int main() {
     // Force the file path to exist directly next to the launching executable binary (.exe)
     std::string filePath = GetExecutableDirectory() + "\\temperature_log.txt";
-    
-    std::ifstream file(filePath);
-    if (!file.is_open()) {
-        std::ofstream create_file(filePath);
-        // Seed base entry matched to real parse expectations
-        create_file << "2026-02-04 12:00:00,\"TempR2\":20.0,\n"; 
-        create_file.close();
-        file.open(filePath);
+
+    std::string fileError;
+    std::error_code fileSystemError;
+    if (!std::filesystem::exists(filePath, fileSystemError) && !fileSystemError) {
+        std::ofstream createFile(filePath);
+        if (createFile.is_open()) {
+            createFile << "2026-02-04 12:00:00,\"TempR2\":20.0,\n";
+        } else {
+            fileError = "Unable to create the default log file.";
+        }
+    } else if (fileSystemError) {
+        fileError = "Unable to check the default log file: " + fileSystemError.message();
     }
 
     if (!glfwInit()) return -1;
@@ -134,26 +223,37 @@ int main() {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImPlot::CreateContext();
+    ImPlot::GetStyle().UseLocalTime = true;
     ImGui::StyleColorsDark();
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
-    std::string line;
+    const auto fileCheckInterval = std::chrono::seconds(2);
+    auto lastFileCheck = std::chrono::steady_clock::now() - fileCheckInterval;
+    LogFileVersion loadedVersion{};
+    bool hasLoadedFile = false;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
-        // READ FROM THE AUTOMATIC PATH LOCATION & STREAM DATA CONTINUOUSLY
-        if (!filePath.empty() && file.is_open()) {
-            while (std::getline(file, line)) {
-                TemperatureEntry data = ParseLine(line);
-                if (data.timestamp >= 0.0) { // Verify timeline conversions succeeded
-                    timeData.push_back(data.timestamp);
-                    tempData.push_back(data.temperature);
+        // Rescan the full file when its size or last-write time changes.
+        const auto now = std::chrono::steady_clock::now();
+        const bool shouldCheckFile = now - lastFileCheck >= fileCheckInterval;
+        if (shouldCheckFile) {
+            lastFileCheck = now;
+        }
+        if (shouldCheckFile && !filePath.empty()) {
+            LogFileVersion currentVersion{};
+            if (!GetLogFileVersion(filePath, currentVersion, fileError)) {
+                hasLoadedFile = false;
+            } else if (!hasLoadedFile || !(currentVersion == loadedVersion)) {
+                if (ReloadLogFile(filePath, timeData, tempData, loadedVersion, fileError)) {
+                    hasLoadedFile = true;
                 }
+            } else {
+                fileError.clear();
             }
-            file.clear(); 
         }
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -167,6 +267,9 @@ int main() {
         ImGui::Text("System Telemetry Workspace");
         ImGui::Text("Active Log Location: %s", filePath.c_str());
         ImGui::Text("Total Live Graph Points: %llu", timeData.size());
+        if (!fileError.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Log file error: %s", fileError.c_str());
+        }
         ImGui::Separator();
 
         // 2. FILE SELECTION INTERFACE AREA
@@ -175,13 +278,11 @@ int main() {
             if (!selectedFile.empty()) {
                 filePath = selectedFile;
                 
-                // Clear old history data vectors instantly to plot the fresh file cleanly
                 timeData.clear();
                 tempData.clear();
-                
-                // Open the new file stream target cleanly
-                if (file.is_open()) file.close();
-                file.open(filePath);
+                hasLoadedFile = false;
+                fileError.clear();
+                lastFileCheck = std::chrono::steady_clock::now() - fileCheckInterval;
             }
         }
         
@@ -200,7 +301,7 @@ int main() {
             ImPlot::SetupAxis(ImAxis_Y1, "Temperature (°C)");
             
             // Formats display to show Month/Day Hour:Minute (e.g. "02/04 14:46")
-            ImPlot::SetupAxisFormat(ImAxis_X1, "%m/%d %H:%M");
+            ImPlot::SetupAxisFormat(ImAxis_X1, "%Y-%m-%d %H:%M");
 
             if (!timeData.empty()) {
                 ImPlot::PlotLine("Room 2 Temp", timeData.data(), tempData.data(), (int)timeData.size());
@@ -221,7 +322,6 @@ int main() {
         glfwSwapBuffers(window);
     }
 
-    if (file.is_open()) file.close();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImPlot::DestroyContext();
