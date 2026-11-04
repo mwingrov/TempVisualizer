@@ -85,7 +85,7 @@ TemperatureEntry ParseLine(const std::string& line) {
         if (commaPos != std::string::npos) {
             std::string tempStr = line.substr(valueStart, commaPos - valueStart);
             try {
-                entry.temperature = std::stod(tempStr);
+                entry.temperature = std::stod(tempStr) / 10.0;
             } catch (...) {
                 entry.timestamp = -1.0; // Flag as error
             }
@@ -202,7 +202,7 @@ int main() {
     if (!std::filesystem::exists(filePath, fileSystemError) && !fileSystemError) {
         std::ofstream createFile(filePath);
         if (createFile.is_open()) {
-            createFile << "2026-02-04 12:00:00,\"TempR2\":20.0,\n";
+            createFile << "2026-02-04 12:00:00,\"TempR2\":200.0,\n";
         } else {
             fileError = "Unable to create the default log file.";
         }
