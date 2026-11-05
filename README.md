@@ -105,6 +105,21 @@ cmake --build build-release
 
 In VS Code, select the `GCC for x86_64-w64-mingw32` kit and choose **Release** as the CMake build type before building and launching. Debug builds are useful for development but can be significantly slower when plotting large logs. The build copies the GLFW runtime DLL beside the executable.
 
+### Testing Live Updates
+Run the PowerShell generator in a separate terminal. By default, it appends one sample per second to `live_test_log.txt` next to the script without changing the existing `temperature_log.txt`:
+```powershell
+.\generate_live_data.ps1
+```
+
+In the visualizer, click **Browse Log File...** and select `live_test_log.txt`. The app checks for log updates every two seconds, so new points should appear as it refreshes. Press `Ctrl+C` in the generator terminal to stop it. To change the output path or update interval, use:
+```powershell
+.\generate_live_data.ps1 -Path .\live_test_log.txt -IntervalSeconds 1
+```
+
+For a finite test run, add `-Count 10` to generate exactly ten records.
+
+The generator appends timestamped records containing all nine plotted temperature keys. Values are integer tenths of a degree and vary slightly between records.
+
 ### Data Format Expectations
 The application targets and continuously reads log structures matching this telemetry schema format natively. When both are present, the JSON `Date` and `Time` fields are used as the timestamp; the leading timestamp is a fallback for older records. The plot includes every temperature key configured in `temperatureChannels` in `main.cpp`: `TempR2`, `TempR3`, `TempR4`, `TempR5LF`, `TempR5LM`, `TempR5LB`, `TempR5RF`, `TempR5RM`, and `TempR5RB`. Readings are in tenths of a degree and are divided by 10 for display (for example, `-6` is displayed as `-0.6°C`). If a record omits one of these keys, that sensor has a gap at that timestamp while the other sensors continue plotting:
 ```text
