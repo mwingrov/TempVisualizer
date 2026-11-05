@@ -28,3 +28,9 @@ target_link_libraries(TemperatureVisualizer PRIVATE
     opengl32
     comdlg32
 )
+
+add_custom_command(TARGET TemperatureVisualizer POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "$<TARGET_FILE:glfw>"
+    "$<TARGET_FILE_DIR:TemperatureVisualizer>"
+)

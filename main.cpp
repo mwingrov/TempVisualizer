@@ -8,6 +8,9 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <ctime>
 #include <chrono>
 #include <filesystem>
@@ -39,10 +42,125 @@ const vector<TemperatureChannel> temperatureChannels = {
 
 vector<vector<double>> temperatureData(temperatureChannels.size());
 
+struct PlotSeries {
+    vector<double> timestamps;
+    vector<double> temperatures;
+};
+
+struct PlotDataCache {
+    double xMin = numeric_limits<double>::quiet_NaN();
+    double xMax = numeric_limits<double>::quiet_NaN();
+    int pixelWidth = 0;
+    uint64_t dataRevision = numeric_limits<uint64_t>::max();
+    vector<PlotSeries> series = vector<PlotSeries>(temperatureChannels.size());
+};
+
 struct TemperatureEntry {
     double timestamp;
     vector<double> temperatures;
 };
+
+void BuildPlotSeries(
+    const vector<double>& timestamps,
+    const vector<double>& temperatures,
+    double xMin,
+    double xMax,
+    int pixelWidth,
+    PlotSeries& output) {
+    output.timestamps.clear();
+    output.temperatures.clear();
+    if (timestamps.empty() || temperatures.size() != timestamps.size()) {
+        return;
+    }
+
+    size_t first = static_cast<size_t>(
+        lower_bound(timestamps.begin(), timestamps.end(), xMin) - timestamps.begin());
+    size_t last = static_cast<size_t>(
+        upper_bound(timestamps.begin(), timestamps.end(), xMax) - timestamps.begin());
+    if (first > 0) {
+        --first;
+    }
+    if (last < timestamps.size()) {
+        ++last;
+    }
+    if (first >= last) {
+        return;
+    }
+
+    const size_t visibleCount = last - first;
+    const size_t bucketCount = static_cast<size_t>(max(pixelWidth, 1));
+    if (visibleCount <= bucketCount * 2) {
+        output.timestamps.assign(timestamps.begin() + first, timestamps.begin() + last);
+        output.temperatures.assign(temperatures.begin() + first, temperatures.begin() + last);
+        return;
+    }
+
+    const double range = xMax - xMin;
+    if (!isfinite(range) || range <= 0.0) {
+        output.timestamps.assign(timestamps.begin() + first, timestamps.begin() + last);
+        output.temperatures.assign(temperatures.begin() + first, temperatures.begin() + last);
+        return;
+    }
+
+    output.timestamps.reserve(bucketCount * 2);
+    output.temperatures.reserve(bucketCount * 2);
+    size_t index = first;
+    while (index < last) {
+        const auto bucketFor = [xMin, range, bucketCount](double timestamp) {
+            const double position = (timestamp - xMin) / range * bucketCount;
+            if (position <= 0.0) {
+                return size_t{0};
+            }
+            if (position >= static_cast<double>(bucketCount)) {
+                return bucketCount - 1;
+            }
+            return static_cast<size_t>(position);
+        };
+        const size_t bucket = bucketFor(timestamps[index]);
+        size_t bucketEnd = index + 1;
+        while (bucketEnd < last && bucketFor(timestamps[bucketEnd]) == bucket) {
+            ++bucketEnd;
+        }
+
+        size_t runStart = index;
+        while (runStart < bucketEnd) {
+            if (!isfinite(temperatures[runStart])) {
+                output.timestamps.push_back(timestamps[runStart]);
+                output.temperatures.push_back(numeric_limits<double>::quiet_NaN());
+                do {
+                    ++runStart;
+                } while (runStart < bucketEnd && !isfinite(temperatures[runStart]));
+                continue;
+            }
+
+            size_t runEnd = runStart;
+            size_t minIndex = runStart;
+            size_t maxIndex = runStart;
+            while (runEnd + 1 < bucketEnd && isfinite(temperatures[runEnd + 1])) {
+                ++runEnd;
+                if (temperatures[runEnd] < temperatures[minIndex]) {
+                    minIndex = runEnd;
+                }
+                if (temperatures[runEnd] > temperatures[maxIndex]) {
+                    maxIndex = runEnd;
+                }
+            }
+
+            size_t selected[4] = {runStart, minIndex, maxIndex, runEnd};
+            sort(begin(selected), end(selected));
+            size_t previous = numeric_limits<size_t>::max();
+            for (size_t selectedIndex : selected) {
+                if (selectedIndex != previous) {
+                    output.timestamps.push_back(timestamps[selectedIndex]);
+                    output.temperatures.push_back(temperatures[selectedIndex]);
+                    previous = selectedIndex;
+                }
+            }
+            runStart = runEnd + 1;
+        }
+        index = bucketEnd;
+    }
+}
 
 double DateStringToEpoch(const string& dateStr) {
     tm t = {};
@@ -105,29 +223,27 @@ TemperatureEntry ParseLine(const string& line) {
     };
     if (line.empty()) return entry;
 
-    if (line.length() >= 19) {
-        entry.timestamp = DateStringToEpoch(line.substr(0, 19));
+    auto getJsonString = [&line](const string& key, string& value) {
+        const string marker = "\"" + key + "\":\"";
+        const size_t valueStart = line.find(marker);
+        if (valueStart == string::npos) return false;
+
+        const size_t contentStart = valueStart + marker.length();
+        const size_t valueEnd = line.find('"', contentStart);
+        if (valueEnd == string::npos) return false;
+
+        value = line.substr(contentStart, valueEnd - contentStart);
+        return true;
+    };
+
+    string date;
+    string time;
+    if (getJsonString("Date", date) && getJsonString("Time", time)) {
+        entry.timestamp = DateStringToEpoch(date + " " + time);
     }
 
-    if (entry.timestamp < 0.0) {
-        auto getJsonString = [&line](const string& key, string& value) {
-            const string marker = "\"" + key + "\":\"";
-            const size_t valueStart = line.find(marker);
-            if (valueStart == string::npos) return false;
-
-            const size_t contentStart = valueStart + marker.length();
-            const size_t valueEnd = line.find('"', contentStart);
-            if (valueEnd == string::npos) return false;
-
-            value = line.substr(contentStart, valueEnd - contentStart);
-            return true;
-        };
-
-        string date;
-        string time;
-        if (getJsonString("Date", date) && getJsonString("Time", time)) {
-            entry.timestamp = DateStringToEpoch(date + " " + time);
-        }
+    if (entry.timestamp < 0.0 && line.length() >= 19) {
+        entry.timestamp = DateStringToEpoch(line.substr(0, 19));
     }
 
     for (size_t i = 0; i < temperatureChannels.size(); ++i) {
@@ -275,6 +391,9 @@ int main() {
     auto lastFileCheck = chrono::steady_clock::now() - fileCheckInterval;
     LogFileVersion loadedVersion{};
     bool hasLoadedFile = false;
+    uint64_t dataRevision = 0;
+    PlotDataCache plotDataCache;
+    bool fitPlotToData = true;
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
@@ -292,6 +411,7 @@ int main() {
             } else if (!hasLoadedFile || !(currentVersion == loadedVersion)) {
                 if (ReloadLogFile(filePath, timeData, temperatureData, loadedVersion, fileError)) {
                     hasLoadedFile = true;
+                    ++dataRevision;
                 }
             } else {
                 fileError.clear();
@@ -324,6 +444,8 @@ int main() {
                 for (vector<double>& channelData : temperatureData) {
                     channelData.clear();
                 }
+                fitPlotToData = true;
+                plotDataCache.dataRevision = numeric_limits<uint64_t>::max();
                 hasLoadedFile = false;
                 fileError.clear();
                 lastFileCheck = chrono::steady_clock::now() - fileCheckInterval;
@@ -348,13 +470,48 @@ int main() {
             ImPlot::SetupAxisFormat(ImAxis_X1, "%Y-%m-%d %H:%M");
 
             if (!timeData.empty()) {
+                double xMin;
+                double xMax;
+                if (fitPlotToData) {
+                    const double firstTimestamp = timeData.front();
+                    const double lastTimestamp = timeData.back();
+                    const double padding = max(1.0, (lastTimestamp - firstTimestamp) * 0.01);
+                    xMin = firstTimestamp - padding;
+                    xMax = lastTimestamp + padding;
+                    ImPlot::SetupAxisLimits(ImAxis_X1, xMin, xMax, ImGuiCond_Always);
+                } else {
+                    const ImPlotRect limits = ImPlot::GetPlotLimits(ImAxis_X1);
+                    xMin = isfinite(limits.X.Min) ? limits.X.Min : timeData.front();
+                    xMax = isfinite(limits.X.Max) ? limits.X.Max : timeData.back();
+                }
+                const int pixelWidth = max(1, static_cast<int>(ImPlot::GetPlotSize().x));
+
+                if (plotDataCache.xMin != xMin || plotDataCache.xMax != xMax ||
+                    plotDataCache.pixelWidth != pixelWidth ||
+                    plotDataCache.dataRevision != dataRevision) {
+                    for (size_t i = 0; i < temperatureChannels.size(); ++i) {
+                        BuildPlotSeries(
+                            timeData,
+                            temperatureData[i],
+                            xMin,
+                            xMax,
+                            pixelWidth,
+                            plotDataCache.series[i]);
+                    }
+                    plotDataCache.xMin = xMin;
+                    plotDataCache.xMax = xMax;
+                    plotDataCache.pixelWidth = pixelWidth;
+                    plotDataCache.dataRevision = dataRevision;
+                }
+
                 for (size_t i = 0; i < temperatureChannels.size(); ++i) {
                     ImPlot::PlotLine(
                         temperatureChannels[i].label.c_str(),
-                        timeData.data(),
-                        temperatureData[i].data(),
-                        static_cast<int>(timeData.size()));
+                        plotDataCache.series[i].timestamps.data(),
+                        plotDataCache.series[i].temperatures.data(),
+                        static_cast<int>(plotDataCache.series[i].timestamps.size()));
                 }
+                fitPlotToData = false;
             }
             ImPlot::EndPlot();
         }

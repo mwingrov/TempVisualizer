@@ -12,6 +12,7 @@ Built using **Dear ImGui**, **ImPlot**, **GLFW**, and **OpenGL3**, the applicati
 *   **Native File Browser:** Built-in Windows file selector dialogue (`GetOpenFileNameA`) to dynamically shift target telemetry files seamlessly on the fly.
 *   **Live Stream Engine:** Non-blocking file-reading pipeline that processes appended logs dynamically without creating exclusive operating system locks.
 *   **Multi-Room Data Extraction:** Reads the configured `TempR2`, `TempR3`, `TempR4`, and `TempR5` sensor metrics from each JSON-like log record, converting values from tenths of a degree and plotting each sensor as a separately labeled line.
+*   **Efficient Plotting:** Limits plotted data to the visible timeline and uses per-pixel min/max sampling to preserve spikes. The reduced series are cached until the view, plot width, or loaded data changes.
 *   **Chronological Tracking:** Absolute Unix Epoch baseline conversion providing proper timeline grouping and structural standard 24-hour axis label scales (`%m/%d %H:%M`).
 
 ---
@@ -96,12 +97,16 @@ add_custom_command(TARGET TemperatureVisualizer POST_BUILD
 
 ## Compilation and Execution
 
-1. Press `Ctrl + Shift + P` inside VS Code and execute: **`CMake: Delete Cache and Reconfigure`**.
-2. Select the `GCC for x86_64-w64-mingw32` active kit framework profile.
-3. Click the **`[Launch]`** status action play triangle button located along the bottom toolbar.
+For normal use, build with optimizations enabled. With the MinGW Makefiles generator, configure a separate Release build directory and compile it with:
+```powershell
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+```
+
+In VS Code, select the `GCC for x86_64-w64-mingw32` kit and choose **Release** as the CMake build type before building and launching. Debug builds are useful for development but can be significantly slower when plotting large logs. The build copies the GLFW runtime DLL beside the executable.
 
 ### Data Format Expectations
-The application targets and continuously reads log structures matching this telemetry schema format natively. The plot includes every temperature key configured in `temperatureChannels` in `main.cpp`: `TempR2`, `TempR3`, `TempR4`, `TempR5LF`, `TempR5LM`, `TempR5LB`, `TempR5RF`, `TempR5RM`, and `TempR5RB`. Readings are in tenths of a degree and are divided by 10 for display (for example, `-6` is displayed as `-0.6°C`). If a record omits one of these keys, that sensor has a gap at that timestamp while the other sensors continue plotting:
+The application targets and continuously reads log structures matching this telemetry schema format natively. When both are present, the JSON `Date` and `Time` fields are used as the timestamp; the leading timestamp is a fallback for older records. The plot includes every temperature key configured in `temperatureChannels` in `main.cpp`: `TempR2`, `TempR3`, `TempR4`, `TempR5LF`, `TempR5LM`, `TempR5LB`, `TempR5RF`, `TempR5RM`, and `TempR5RB`. Readings are in tenths of a degree and are divided by 10 for display (for example, `-6` is displayed as `-0.6°C`). If a record omits one of these keys, that sensor has a gap at that timestamp while the other sensors continue plotting:
 ```text
 2026-02-04 14:46:20 | Data | {"TempR2":63,"TempR3":1,"TempR4":-16,"TempR5LF":1,"TempR5LM":-1,"TempR5LB":-3,"TempR5RF":12,"TempR5RM":3,"TempR5RB":-5}
 2026-02-04 14:46:30 | Data | {"TempR2":62,"TempR3":0,"TempR4":-16,"TempR5LF":1,"TempR5LM":-1,"TempR5LB":-3,"TempR5RF":6,"TempR5RM":-1,"TempR5RB":-6}
