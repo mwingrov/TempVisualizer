@@ -11,110 +11,150 @@
 #include <ctime>
 #include <chrono>
 #include <filesystem>
+#include <limits>
+#include <stdexcept>
 #include <windows.h>
 #include <commdlg.h>
 
-std::vector<double> timeData;
-std::vector<double> tempData;
+using namespace std;
 
-struct TemperatureEntry {
-    double timestamp; // Absolute Unix Epoch seconds
-    double temperature;
+vector<double> timeData;
+
+struct TemperatureChannel {
+    string key;
+    string label;
 };
 
-// Converts "YYYY-MM-DD HH:MM:SS" directly into absolute Unix Epoch Seconds
-double DateStringToEpoch(const std::string& dateStr) {
-    std::tm t = {};
-    std::stringstream ss(dateStr);
+const vector<TemperatureChannel> temperatureChannels = {
+    {"TempR2", "Room 2 Temp"},
+    {"TempR3", "Room 3 Temp"},
+    {"TempR4", "Room 4 Temp"},
+    {"TempR5LF", "Room 5 Left Front Temp"},
+    {"TempR5LM", "Room 5 Left Middle Temp"},
+    {"TempR5LB", "Room 5 Left Back Temp"},
+    {"TempR5RF", "Room 5 Right Front Temp"},
+    {"TempR5RM", "Room 5 Right Middle Temp"},
+    {"TempR5RB", "Room 5 Right Back Temp"}
+};
+
+vector<vector<double>> temperatureData(temperatureChannels.size());
+
+struct TemperatureEntry {
+    double timestamp;
+    vector<double> temperatures;
+};
+
+double DateStringToEpoch(const string& dateStr) {
+    tm t = {};
+    stringstream ss(dateStr);
     char dash, colon;
-    
-    // Parse expected format: 2026-02-04 14:46:20
-    if (ss >> t.tm_year >> dash >> t.tm_mon >> dash >> t.tm_mday 
-           >> t.tm_hour >> colon >> t.tm_min >> colon >> t.tm_sec) 
+
+    if (ss >> t.tm_year >> dash >> t.tm_mon >> dash >> t.tm_mday
+           >> t.tm_hour >> colon >> t.tm_min >> colon >> t.tm_sec)
     {
-        t.tm_year -= 1900; // std::tm expects years since 1900
-        t.tm_mon -= 1;     // std::tm months are 0-indexed (0 = January)
-        t.tm_isdst = -1;   // Let the system determine Daylight Saving Time Automatically
-        
-        std::time_t epochTime = std::mktime(&t);
+        t.tm_year -= 1900;
+        t.tm_mon -= 1;
+        t.tm_isdst = -1;
+
+        time_t epochTime = mktime(&t);
         if (epochTime != -1) {
             return static_cast<double>(epochTime);
         }
     }
-    return -1.0; // Return error sentinel if parsing fails
+    return -1.0;
 }
 
-TemperatureEntry ParseLine(const std::string& line) {
-    TemperatureEntry entry{-1.0, 0.0};
+bool ParseTemperature(const string& line, const string& key, double& temperature) {
+    const string marker = "\"" + key + "\":";
+    const size_t markerPos = line.find(marker);
+    if (markerPos == string::npos) {
+        return false;
+    }
+
+    const size_t valueStart = markerPos + marker.length();
+    const size_t valueEnd = line.find_first_of(",}", valueStart);
+    const string valueText = line.substr(
+        valueStart,
+        valueEnd == string::npos ? string::npos : valueEnd - valueStart);
+
+    try {
+        size_t parsedLength = 0;
+        const double parsedValue = stod(valueText, &parsedLength);
+        while (parsedLength < valueText.length() &&
+               (valueText[parsedLength] == ' ' || valueText[parsedLength] == '\t' ||
+                valueText[parsedLength] == '\r')) {
+            ++parsedLength;
+        }
+        if (parsedLength != valueText.length()) {
+            return false;
+        }
+
+        temperature = parsedValue / 10.0;
+        return true;
+    } catch (const invalid_argument&) {
+        return false;
+    } catch (const out_of_range&) {
+        return false;
+    }
+}
+
+TemperatureEntry ParseLine(const string& line) {
+    TemperatureEntry entry{
+        -1.0,
+        vector<double>(temperatureChannels.size(), numeric_limits<double>::quiet_NaN())
+    };
     if (line.empty()) return entry;
 
-    // Older logs start with a timestamp such as "2026-02-04 14:46:20".
     if (line.length() >= 19) {
         entry.timestamp = DateStringToEpoch(line.substr(0, 19));
     }
 
-    // Newer logs store the timestamp in separate JSON Date and Time fields.
     if (entry.timestamp < 0.0) {
-        auto getJsonString = [&line](const std::string& key, std::string& value) {
-            const std::string marker = "\"" + key + "\":\"";
+        auto getJsonString = [&line](const string& key, string& value) {
+            const string marker = "\"" + key + "\":\"";
             const size_t valueStart = line.find(marker);
-            if (valueStart == std::string::npos) return false;
+            if (valueStart == string::npos) return false;
 
             const size_t contentStart = valueStart + marker.length();
             const size_t valueEnd = line.find('"', contentStart);
-            if (valueEnd == std::string::npos) return false;
+            if (valueEnd == string::npos) return false;
 
             value = line.substr(contentStart, valueEnd - contentStart);
             return true;
         };
 
-        std::string date;
-        std::string time;
+        string date;
+        string time;
         if (getJsonString("Date", date) && getJsonString("Time", time)) {
             entry.timestamp = DateStringToEpoch(date + " " + time);
         }
     }
 
-    std::string key = "\"TempR2\":";
-    size_t keyPos = line.find(key);
-    
-    if (keyPos != std::string::npos) {
-        size_t valueStart = keyPos + key.length();
-        size_t commaPos = line.find(',', valueStart);
-        
-        if (commaPos != std::string::npos) {
-            std::string tempStr = line.substr(valueStart, commaPos - valueStart);
-            try {
-                entry.temperature = std::stod(tempStr) / 10.0;
-            } catch (...) {
-                entry.timestamp = -1.0; // Flag as error
-            }
-        }
-    } else {
-        entry.timestamp = -1.0; // Key wasn't found
+    for (size_t i = 0; i < temperatureChannels.size(); ++i) {
+        ParseTemperature(line, temperatureChannels[i].key, entry.temperatures[i]);
     }
 
     return entry;
 }
 
 struct LogFileVersion {
-    std::uintmax_t size;
-    std::filesystem::file_time_type lastWriteTime;
+    uintmax_t size;
+    filesystem::file_time_type lastWriteTime;
 };
 
 bool operator==(const LogFileVersion& left, const LogFileVersion& right) {
     return left.size == right.size && left.lastWriteTime == right.lastWriteTime;
 }
 
-bool GetLogFileVersion(const std::string& filePath, LogFileVersion& version, std::string& error) {
-    std::error_code errorCode;
-    version.size = std::filesystem::file_size(filePath, errorCode);
+bool GetLogFileVersion(const string& filePath, LogFileVersion& version, string& error) {
+    error_code errorCode;
+    version.size = filesystem::file_size(filePath, errorCode);
     if (errorCode) {
         error = "Unable to check log file: " + errorCode.message();
         return false;
     }
 
-    version.lastWriteTime = std::filesystem::last_write_time(filePath, errorCode);
+    version.lastWriteTime = filesystem::last_write_time(filePath, errorCode);
     if (errorCode) {
         error = "Unable to check log file: " + errorCode.message();
         return false;
@@ -124,30 +164,32 @@ bool GetLogFileVersion(const std::string& filePath, LogFileVersion& version, std
 }
 
 bool ReloadLogFile(
-    const std::string& filePath,
-    std::vector<double>& timestamps,
-    std::vector<double>& temperatures,
+    const string& filePath,
+    vector<double>& timestamps,
+    vector<vector<double>>& temperatures,
     LogFileVersion& loadedVersion,
-    std::string& error) {
+    string& error) {
     LogFileVersion currentVersion;
     if (!GetLogFileVersion(filePath, currentVersion, error)) {
         return false;
     }
 
-    std::ifstream input(filePath);
+    ifstream input(filePath);
     if (!input.is_open()) {
         error = "Unable to open log file for reading.";
         return false;
     }
 
-    std::vector<double> newTimestamps;
-    std::vector<double> newTemperatures;
-    std::string line;
-    while (std::getline(input, line)) {
+    vector<double> newTimestamps;
+    vector<vector<double>> newTemperatures(temperatureChannels.size());
+    string line;
+    while (getline(input, line)) {
         TemperatureEntry data = ParseLine(line);
         if (data.timestamp >= 0.0) {
             newTimestamps.push_back(data.timestamp);
-            newTemperatures.push_back(data.temperature);
+            for (size_t i = 0; i < data.temperatures.size(); ++i) {
+                newTemperatures[i].push_back(data.temperatures[i]);
+            }
         }
     }
 
@@ -164,7 +206,7 @@ bool ReloadLogFile(
 }
 
 // Function to trigger the built-in Windows Open File Explorer window
-std::string OpenFileDialog() {
+string OpenFileDialog() {
     char szFile[260] = { 0 };
     OPENFILENAMEA ofn;
     ZeroMemory(&ofn, sizeof(ofn));
@@ -180,29 +222,29 @@ std::string OpenFileDialog() {
     ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
 
     if (GetOpenFileNameA(&ofn) == TRUE) {
-        return std::string(ofn.lpstrFile);
+        return string(ofn.lpstrFile);
     }
     return ""; // Return empty string if the user cancelled the action
 }
 
 // Helper function to get the exact directory where the .exe file sits
-std::string GetExecutableDirectory() {
+string GetExecutableDirectory() {
     char buffer[MAX_PATH];
     GetModuleFileNameA(NULL, buffer, MAX_PATH);
-    std::string::size_type pos = std::string(buffer).find_last_of("\\/");
-    return std::string(buffer).substr(0, pos);
+    string::size_type pos = string(buffer).find_last_of("\\/");
+    return string(buffer).substr(0, pos);
 }
 
 int main() {
     // Force the file path to exist directly next to the launching executable binary (.exe)
-    std::string filePath = GetExecutableDirectory() + "\\temperature_log.txt";
+    string filePath = GetExecutableDirectory() + "\\temperature_log.txt";
 
-    std::string fileError;
-    std::error_code fileSystemError;
-    if (!std::filesystem::exists(filePath, fileSystemError) && !fileSystemError) {
-        std::ofstream createFile(filePath);
+    string fileError;
+    error_code fileSystemError;
+    if (!filesystem::exists(filePath, fileSystemError) && !fileSystemError) {
+        ofstream createFile(filePath);
         if (createFile.is_open()) {
-            createFile << "2026-02-04 12:00:00,\"TempR2\":200.0,\n";
+            createFile << "2026-02-04 12:00:00,\"TempR2\":200.0,\"TempR3\":210.0,\n";
         } else {
             fileError = "Unable to create the default log file.";
         }
@@ -229,8 +271,8 @@ int main() {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 130");
 
-    const auto fileCheckInterval = std::chrono::seconds(2);
-    auto lastFileCheck = std::chrono::steady_clock::now() - fileCheckInterval;
+    const auto fileCheckInterval = chrono::seconds(2);
+    auto lastFileCheck = chrono::steady_clock::now() - fileCheckInterval;
     LogFileVersion loadedVersion{};
     bool hasLoadedFile = false;
 
@@ -238,7 +280,7 @@ int main() {
         glfwPollEvents();
 
         // Rescan the full file when its size or last-write time changes.
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = chrono::steady_clock::now();
         const bool shouldCheckFile = now - lastFileCheck >= fileCheckInterval;
         if (shouldCheckFile) {
             lastFileCheck = now;
@@ -248,7 +290,7 @@ int main() {
             if (!GetLogFileVersion(filePath, currentVersion, fileError)) {
                 hasLoadedFile = false;
             } else if (!hasLoadedFile || !(currentVersion == loadedVersion)) {
-                if (ReloadLogFile(filePath, timeData, tempData, loadedVersion, fileError)) {
+                if (ReloadLogFile(filePath, timeData, temperatureData, loadedVersion, fileError)) {
                     hasLoadedFile = true;
                 }
             } else {
@@ -274,15 +316,17 @@ int main() {
 
         // 2. FILE SELECTION INTERFACE AREA
         if (ImGui::Button("Browse Log File...", ImVec2(200, 30))) {
-            std::string selectedFile = OpenFileDialog();
+            string selectedFile = OpenFileDialog();
             if (!selectedFile.empty()) {
                 filePath = selectedFile;
                 
                 timeData.clear();
-                tempData.clear();
+                for (vector<double>& channelData : temperatureData) {
+                    channelData.clear();
+                }
                 hasLoadedFile = false;
                 fileError.clear();
-                lastFileCheck = std::chrono::steady_clock::now() - fileCheckInterval;
+                lastFileCheck = chrono::steady_clock::now() - fileCheckInterval;
             }
         }
         
@@ -304,7 +348,13 @@ int main() {
             ImPlot::SetupAxisFormat(ImAxis_X1, "%Y-%m-%d %H:%M");
 
             if (!timeData.empty()) {
-                ImPlot::PlotLine("Room 2 Temp", timeData.data(), tempData.data(), (int)timeData.size());
+                for (size_t i = 0; i < temperatureChannels.size(); ++i) {
+                    ImPlot::PlotLine(
+                        temperatureChannels[i].label.c_str(),
+                        timeData.data(),
+                        temperatureData[i].data(),
+                        static_cast<int>(timeData.size()));
+                }
             }
             ImPlot::EndPlot();
         }

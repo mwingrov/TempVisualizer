@@ -11,7 +11,7 @@ Built using **Dear ImGui**, **ImPlot**, **GLFW**, and **OpenGL3**, the applicati
 *   **Interactive Charting:** Dynamic, hardware-accelerated timeline graph supporting native **Left-Click + Drag to Pan** and **Right-Click / Mouse-Wheel to Zoom**.
 *   **Native File Browser:** Built-in Windows file selector dialogue (`GetOpenFileNameA`) to dynamically shift target telemetry files seamlessly on the fly.
 *   **Live Stream Engine:** Non-blocking file-reading pipeline that processes appended logs dynamically without creating exclusive operating system locks.
-*   **Custom Data Extraction:** Custom, optimized substring string-parser targeting the exact JSON-like machine telemetry payload (extracting timestamp signatures and `TempR2` room metrics, with logged temperature values converted from tenths of a degree).
+*   **Multi-Room Data Extraction:** Reads the configured `TempR2`, `TempR3`, `TempR4`, and `TempR5` sensor metrics from each JSON-like log record, converting values from tenths of a degree and plotting each sensor as a separately labeled line.
 *   **Chronological Tracking:** Absolute Unix Epoch baseline conversion providing proper timeline grouping and structural standard 24-hour axis label scales (`%m/%d %H:%M`).
 
 ---
@@ -101,8 +101,8 @@ add_custom_command(TARGET TemperatureVisualizer POST_BUILD
 3. Click the **`[Launch]`** status action play triangle button located along the bottom toolbar.
 
 ### Data Format Expectations
-The application targets and continuously reads log structures matching this telemetry schema format natively. Temperature readings plotted from `TempR2` are in tenths of a degree and are divided by 10 for display (for example, `-6` is displayed as `-0.6°C`):
+The application targets and continuously reads log structures matching this telemetry schema format natively. The plot includes every temperature key configured in `temperatureChannels` in `main.cpp`: `TempR2`, `TempR3`, `TempR4`, `TempR5LF`, `TempR5LM`, `TempR5LB`, `TempR5RF`, `TempR5RM`, and `TempR5RB`. Readings are in tenths of a degree and are divided by 10 for display (for example, `-6` is displayed as `-0.6°C`). If a record omits one of these keys, that sensor has a gap at that timestamp while the other sensors continue plotting:
 ```text
-2026-02-04 14:46:20 | Data | {"TempR2":63,"TempR3":1,"TempR4":-16}
-2026-02-04 14:46:30 | Data | {"TempR2":62,"TempR3":0,"TempR4":-16}
+2026-02-04 14:46:20 | Data | {"TempR2":63,"TempR3":1,"TempR4":-16,"TempR5LF":1,"TempR5LM":-1,"TempR5LB":-3,"TempR5RF":12,"TempR5RM":3,"TempR5RB":-5}
+2026-02-04 14:46:30 | Data | {"TempR2":62,"TempR3":0,"TempR4":-16,"TempR5LF":1,"TempR5LM":-1,"TempR5LB":-3,"TempR5RF":6,"TempR5RM":-1,"TempR5RB":-6}
 ```
